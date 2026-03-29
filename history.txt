@@ -54,3 +54,9 @@ LET $france = (SELECT vector FROM ONLY embeddings:T7001).vector;\nLET $neighbour
 SELECT top_k FROM ffn_down:L26_F3593;
 -- What do L26 attention heads write? (OV vectors against embeddings)\nLET $v = (SELECT vector FROM ONLY attn_ov:L26_H0).vector;\nSELECT id, top_token, vector::distance::knn() AS dist\nFROM embeddings WHERE vector <|10, COSINE|> $v ORDER BY dist;
 exit
+-- What do L26 attention heads write? (OV vectors against embeddings)\nLET $v = (SELECT vector FROM ONLY attn_ov:L26_H0).vector;\nSELECT id, top_token, vector::distance::knn() AS dist\nFROM embeddings WHERE vector <|10, COSINE|> $v ORDER BY dist;
+-- What does head 0 at L26 respond to? (QK vectors against embeddings)\nLET $v = (SELECT vector FROM ONLY attn_qk:L26_H0).vector;\nSELECT id, top_token, vector::distance::knn() AS dist\nFROM embeddings WHERE vector <|10, COSINE|> $v ORDER BY dist;
+-- Which attention heads' OV vectors are nearest to "Germany"?\nLET $v = (SELECT vector FROM ONLY embeddings WHERE top_token = 'Germany' LIMIT 1).vector;\nSELECT id, layer, feature AS head, top_token, vector::distance::knn() AS dist\nFROM attn_ov WHERE vector <|5, COSINE|> $v ORDER BY dist;
+-- Which attention heads' OV vectors are nearest to "German"?\nLET $v = (SELECT vector FROM ONLY embeddings WHERE top_token = 'German' LIMIT 1).vector;\nSELECT id, layer, feature AS head, top_token, vector::distance::knn() AS dist\nFROM attn_ov WHERE vector <|5, COSINE|> $v ORDER BY dist;
+exit
+clear
