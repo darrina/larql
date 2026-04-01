@@ -1595,3 +1595,361 @@ The split is clean: knowledge access works on anything, generation needs compute
 **Cost reduction.** A company paying $50K/year for GPU inference to answer knowledge questions switches to a $240/year VPS serving vindex queries. The 99% of queries that are knowledge lookups become nearly free. The 1% that need generation route to the GPU cluster.
 
 **Privacy.** The vindex runs locally. No data leaves the device. No API calls to log. No prompts stored on someone else's server. The model's knowledge is a local file, queryable offline, with no network dependency.
+
+---
+
+## 13. Publishing and Registry
+
+### 13.1 HuggingFace Publishing
+
+Vindexes publish to HuggingFace as dataset repos. The directory maps 1:1 to the repo structure. Each file is a separate blob with HuggingFace CDN distribution, versioning, and access control.
+
+```bash
+# Build locally
+larql extract-index google/gemma-3-4b-it -o gemma3-4b.vindex --include-weights
+
+# Run probes for labels (optional, adds value)
+python3 scripts/probe_mlx.py --model google/gemma-3-4b-it --vindex gemma3-4b.vindex
+
+# Publish
+larql publish gemma3-4b.vindex --repo chrishayuk/gemma-3-4b-it-vindex
+
+# Anyone can now use it
+larql> USE "hf://chrishayuk/gemma-3-4b-it-vindex";
+```
+
+**Lazy loading.** `USE` downloads only `index.json` first (~5 KB). Gate vectors and embeddings download on first DESCRIBE (~6 GB). Attention weights download only if INFER is called (+2 GB). Compile weights download only if COMPILE is called (+9 GB). You pay for what you use.
+
+**Pre-labelled vindexes** with probe-confirmed labels are the premium artifacts. Build once with the full probe pipeline, publish, everyone gets rich DESCRIBE output without running their own probes.
+
+### 13.2 Patch Publishing
+
+Patches publish the same way — as HuggingFace repos or any URL:
+
+```bash
+# Publish a patch
+larql publish-patch medical-knowledge.vlp \
+  --repo medical-ai/drug-interactions \
+  --base google/gemma-3-4b-it
+
+# Apply remote patches
+larql> USE "hf://chrishayuk/gemma-3-4b-it-vindex";
+larql> APPLY PATCH "hf://medical-ai/drug-interactions@2.1.0";
+larql> APPLY PATCH "hf://legal-team/uk-case-law-2026@1.0.0";
+```
+
+A patch ecosystem emerges on HuggingFace:
+
+```
+Base models:
+  chrishayuk/gemma-3-4b-it-vindex
+  chrishayuk/llama-3-8b-vindex
+  chrishayuk/mistral-7b-vindex
+
+Knowledge patches:
+  medical-ai/drug-interactions           (5K facts, 50 MB)
+  legal-team/uk-case-law-2026            (3K facts, 30 MB)
+  sports-data/premier-league-2026        (10K facts, 100 MB)
+  fix-hallucinations/gemma-3-4b-v1       (200 corrections, 2 MB)
+  finance-team/market-knowledge          (2K facts, 20 MB)
+```
+
+Patches are versioned, dependency-tracked, and composable. Like npm packages for model knowledge.
+
+**Patch metadata:**
+
+```json
+{
+  "name": "drug-interactions",
+  "version": "2.1.0",
+  "base_model": "google/gemma-3-4b-it",
+  "base_checksum": "a1b2c3d4...",
+  "depends_on": ["hf://medical-ai/anatomy-basics@1.0.0"],
+  "operations": 5000,
+  "size_bytes": 52428800,
+  "author": "medical-ai",
+  "license": "CC-BY-4.0",
+  "description": "Drug interaction facts from FDA database"
+}
+```
+
+---
+
+## 14. Remote Serving
+
+### 14.1 Vindex Server
+
+A lightweight Rust binary that loads a vindex and serves queries over HTTP. No GPU, no ML framework, no Python.
+
+```bash
+# Serve a single model
+larql serve gemma3-4b.vindex --port 8080
+
+# Serve multiple models
+larql serve --dir ./vindexes/ --port 8080
+# Endpoints: /gemma-3-4b-it/*, /llama-3-8b/*, /mistral-7b/*
+
+# Serve from HuggingFace directly
+larql serve "hf://chrishayuk/gemma-3-4b-it-vindex" --port 8080
+```
+
+### 14.2 API Endpoints
+
+```
+Knowledge (browse-only, no GPU):
+  GET  /v1/describe?entity=France
+  GET  /v1/walk?prompt=Einstein&top=10
+  GET  /v1/select?relation=capital&limit=20
+  GET  /v1/relations
+  GET  /v1/stats
+
+Inference (requires attention weights):
+  POST /v1/infer    {"prompt": "The capital of France is", "top": 5}
+
+Management:
+  GET  /v1/health
+  GET  /v1/models
+  POST /v1/patches/apply  {"url": "hf://medical-ai/drug-interactions@2.1.0"}
+  GET  /v1/patches
+```
+
+### 14.3 Client-Side Patches on Remote Base
+
+The server hosts the base model. The client brings patches. The server applies them per-request or per-session:
+
+```sql
+-- Connect to remote base model (download nothing)
+USE REMOTE "https://vindex.larql.dev/gemma-3-4b-it";
+
+-- Apply local patches on top of remote base
+APPLY PATCH "medical-knowledge.vlp";      -- 50 MB local
+APPLY PATCH "company-facts.vlp";          -- 2 MB local
+
+-- Queries combine remote base + local patches
+DESCRIBE "aspirin";
+-- side_effect → bleeding   (local patch)
+-- occupation → drug        (remote base)
+```
+
+The patches never leave the client. The server sees queries but not patch contents. Proprietary knowledge stays local while the base model's knowledge comes from the server.
+
+### 14.4 Remote Patches on Remote Base
+
+Patches can also be remote — hosted on HuggingFace, GitHub, or any URL:
+
+```sql
+USE REMOTE "https://vindex.larql.dev/gemma-3-4b-it";
+
+-- Remote community patches
+APPLY PATCH "hf://medical-ai/drug-interactions@2.1.0";
+APPLY PATCH "hf://legal-team/uk-case-law-2026@1.0.0";
+
+-- Remote private patches (authenticated)
+APPLY PATCH "https://patches.company.com/internal-facts.vlp";
+
+-- Local overrides
+APPLY PATCH "./my-fixes.vlp";
+
+DESCRIBE "aspirin";
+-- Combines: remote base + remote medical + remote legal + remote company + local fixes
+```
+
+### 14.5 Multi-Tenant Serving
+
+Same server, different knowledge per client:
+
+```
+Server:   17 GB base vindex, serves all clients
+Client A: base + medical.vlp          (doctor)
+Client B: base + legal.vlp            (lawyer)
+Client C: base + medical + company.vlp (pharma company)
+```
+
+No fine-tuning per customer. No separate model per customer. One base model + patches. The economics:
+
+```
+Traditional: Fine-tune per customer      $50K each, $500K for 10 customers
+Vindex:      One base + patches/customer  $240/year total for all customers
+```
+
+---
+
+## 15. Vindexfile — Declarative Model Builds
+
+### 15.1 Format
+
+A `Vindexfile` is a declarative specification for building a custom model from a base vindex plus patches and edits. Like a Dockerfile for model knowledge.
+
+```dockerfile
+# Vindexfile
+
+# Base model — pulled from HuggingFace
+FROM hf://chrishayuk/gemma-3-4b-it-vindex
+
+# Community knowledge patches — applied in order
+PATCH hf://medical-ai/drug-interactions@2.1.0
+PATCH hf://medical-ai/anatomy-basics@1.0.0
+PATCH hf://legal-team/uk-case-law-2026@1.0.0
+
+# Bug fixes
+PATCH hf://fix-hallucinations/gemma-3-4b-v1@1.2.0
+
+# Local patches
+PATCH ./patches/company-facts.vlp
+PATCH ./patches/product-catalog.vlp
+
+# Inline edits
+INSERT ("Acme Corp", "headquarters", "London")
+INSERT ("Acme Corp", "ceo", "Jane Smith")
+INSERT ("Acme Corp", "founded", "2019")
+DELETE entity = "Acme Corp" AND relation = "competitor" AND target = "WrongCo"
+
+# Probe labels
+LABELS hf://chrishayuk/gemma-3-4b-it-labels@latest
+
+# Build configuration
+EXPOSE browse inference
+```
+
+### 15.2 Build Commands
+
+```bash
+# Build a custom model from a Vindexfile
+larql build .
+# → Downloads base from HuggingFace (if not cached)
+# → Downloads remote patches (if not cached)
+# → Applies patches in order
+# → Runs inline edits
+# → Merges labels
+# → Produces: ./build/vindex/
+
+# Build and compile to safetensors
+larql build . --compile safetensors --output acme-model/
+# → Same as above, then compiles to HuggingFace-compatible model
+
+# Build and compile to GGUF for deployment
+larql build . --compile gguf --quant Q4_K_M --output acme-model.gguf
+
+# Build and compile to MLX
+larql build . --compile mlx --output acme-model-mlx/
+
+# Serve directly without compiling (development mode)
+larql serve .
+# → Loads base, stacks patches, serves queries with live reload
+
+# Publish the built model
+larql build . --publish hf://acme-corp/acme-medical-model
+```
+
+### 15.3 Build Layers and History
+
+Like Docker, builds are layered. Each PATCH and INSERT is a layer. Builds are reproducible — same Vindexfile, same result every time.
+
+```bash
+larql history build/vindex/
+# Layer 0: FROM gemma-3-4b-it-vindex          (348,160 features)
+# Layer 1: PATCH drug-interactions@2.1.0      (+5,000 features modified)
+# Layer 2: PATCH anatomy-basics@1.0.0         (+1,200 features modified)
+# Layer 3: PATCH uk-case-law-2026@1.0.0       (+3,000 features modified)
+# Layer 4: PATCH gemma-3-4b-v1@1.2.0          (+200 features corrected)
+# Layer 5: PATCH company-facts.vlp            (+15 features added)
+# Layer 6: INSERT 3 edges                     (+3 features added)
+# Layer 7: DELETE 1 edge                      (-1 feature removed)
+# Layer 8: LABELS gemma-3-4b-it-labels        (1,967 labels applied)
+#
+# Total: 348,177 active features, 9,418 modified from base
+# Build time: 4.2s
+# Build size: 17.1 GB (full) / 6.0 GB (browse-only)
+```
+
+### 15.4 Dependency Resolution
+
+Patches can declare dependencies. The build resolves them automatically:
+
+```json
+{
+  "name": "drug-interactions",
+  "version": "2.1.0",
+  "depends_on": ["hf://medical-ai/anatomy-basics@>=1.0.0"]
+}
+```
+
+```bash
+larql build .
+# Resolving dependencies...
+#   drug-interactions@2.1.0 requires anatomy-basics@>=1.0.0
+#   anatomy-basics@1.0.0 already in Vindexfile ✓
+# All dependencies satisfied.
+```
+
+### 15.5 Environment Variants
+
+Like Docker multi-stage builds, a Vindexfile can define variants for different environments:
+
+```dockerfile
+# Vindexfile
+
+FROM hf://chrishayuk/gemma-3-4b-it-vindex
+
+# Shared patches
+PATCH hf://fix-hallucinations/gemma-3-4b-v1@1.2.0
+
+# Development: all knowledge, full access
+STAGE dev
+  PATCH ./patches/experimental-knowledge.vlp
+  EXPOSE browse inference compile
+
+# Production: curated knowledge only, browse + infer
+STAGE prod
+  PATCH hf://medical-ai/drug-interactions@2.1.0
+  PATCH ./patches/company-facts.vlp
+  EXPOSE browse inference
+
+# Edge: minimal knowledge, browse only
+STAGE edge
+  PATCH ./patches/core-facts.vlp
+  EXPOSE browse
+```
+
+```bash
+larql build . --stage prod
+larql build . --stage edge --compile gguf --quant Q4_K_M
+```
+
+### 15.6 CI/CD Integration
+
+Vindexfiles are version-controlled. CI validates builds automatically:
+
+```yaml
+# .github/workflows/build-model.yml
+name: Build Model
+on:
+  push:
+    paths: ['Vindexfile', 'patches/**']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: larql/setup-action@v1
+      
+      - name: Build
+        run: larql build . --stage prod
+      
+      - name: Verify round-trip
+        run: larql verify build/vindex/
+      
+      - name: Test knowledge
+        run: |
+          larql query build/vindex/ "DESCRIBE 'France'" | grep "capital.*Paris"
+          larql query build/vindex/ "DESCRIBE 'Acme Corp'" | grep "headquarters.*London"
+      
+      - name: Publish
+        if: github.ref == 'refs/heads/main'
+        run: larql build . --publish hf://acme-corp/acme-model
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+```
+
+Every push to the Vindexfile triggers a rebuild. Tests verify that key facts exist. Main branch auto-publishes. Model knowledge gets the same CI/CD rigour as application code.

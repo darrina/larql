@@ -522,11 +522,10 @@ def main() -> None:
                                     prediction_labels[best_feat] = rel_name
                                     pred_matched += 1
                         else:
-                            # No vindex — record as relation-level match
-                            pred_key = f"pred_{rel_name}_{pred_token}"
-                            if pred_key not in prediction_labels:
-                                prediction_labels[pred_key] = rel_name
-                                pred_matched += 1
+                            # No vindex — can't map to (layer, feature).
+                            # Count the match but don't create a label entry
+                            # (labels without feature addresses are useless).
+                            pred_matched += 1
                         break
 
         elapsed = time.time() - start_time
@@ -545,10 +544,13 @@ def main() -> None:
         f"\nTotal: {total_probes} probes in {elapsed:.0f}s"
         f" ({total_probes/elapsed:.1f}/s)"
     )
-    print(
-        f"Gate-matched: {len(feature_labels)} features, "
-        f"Prediction-matched: {len(prediction_labels)} features"
-    )
+    print(f"Gate-matched: {len(feature_labels)} labeled features")
+    print(f"Prediction-matched: {len(prediction_labels)} labeled features")
+    if not has_vindex and pred_matched > 0:
+        print(
+            f"  ({pred_matched} predictions confirmed but not saved"
+            f" — re-run with --vindex to map to features)"
+        )
 
     # Merge: gate labels take priority, prediction labels fill gaps
     all_labels = dict(feature_labels)
@@ -556,7 +558,7 @@ def main() -> None:
         if key not in all_labels:
             all_labels[key] = rel
 
-    print(f"Combined: {len(all_labels)} unique features")
+    print(f"Combined: {len(all_labels)} unique labeled features")
 
     if relation_counts:
         print("\nRelation distribution (gate-matched):")
