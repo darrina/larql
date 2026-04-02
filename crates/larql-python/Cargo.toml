@@ -19,4 +19,6 @@ larql-lql = { path = "../larql-lql" }
 pyo3 = { version = "0.24", features = ["extension-module"] }
 numpy = "0.24"
 ndarray = "0.16"
+memmap2 = "0.9"
+serde = { workspace = true }
 serde_json = { workspace = true }

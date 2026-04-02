@@ -22,9 +22,9 @@ edges = vindex.describe("France")
 for e in edges[:5]:
     print(f"  {e.relation} → {e.target}  score={e.gate_score:.0f}")
 
-# Embed + KNN
-embed = vindex.embed("France")           # numpy (2560,)
-hits = vindex.entity_knn("France", layer=26, top_k=10)
+# Full inference — Rust attention + walk FFN
+result = vindex.infer("The capital of France is")
+# [("Paris", 0.805), ...]
 
 # Insert knowledge — no training
 vindex.insert("Colchester", "country", "England")
@@ -33,38 +33,71 @@ vindex.insert("Colchester", "country", "England")
 gates = vindex.gate_vectors(layer=26)     # numpy (10240, 2560)
 ```
 
-## MLX Integration
+## Inference — Three Paths
 
-Load MLX models directly from a vindex. No safetensors. Weights are mmap'd from vindex binaries.
+### 1. Pure Rust (`vindex.infer`)
+
+Full forward pass in Rust. No MLX, no GPU, no dependencies.
 
 ```python
-import larql
+vindex = larql.load("model.vindex")
+result = vindex.infer("The capital of France is")
+# [("Paris", 0.805), ...]
+```
+
+### 2. MLX Generation (`larql.mlx.load`)
+
+MLX handles generation (KV cache, sampling, chat). Weights loaded from vindex.
+
+```python
+import larql, mlx_lm
+
+model, tokenizer = larql.mlx.load("model.vindex")
+response = mlx_lm.generate(model, tokenizer, prompt="...", max_tokens=20)
+```
+
+### 3. Walk FFN (`larql.walk_ffn.load`)
+
+MLX attention + Rust sparse FFN. FFN weights mmap'd — only touched pages loaded.
+For models that don't fit in memory.
+
+```python
+from larql.walk_ffn import load
 import mlx_lm
 
-model, tokenizer = larql.mlx.load("output/gemma3-4b-v2.vindex")
-response = mlx_lm.generate(model, tokenizer, prompt="The capital of France is", max_tokens=20)
-print(response)
+model, tokenizer = load("model.vindex", top_k=4096)
+response = mlx_lm.generate(model, tokenizer, prompt="...", max_tokens=20)
+# Walk FFN: 7.1 GB FFN weights handled by Rust (not in MLX memory)
 ```
 
-For best performance, extract with `--f16`:
-```bash
-larql extract-index "google/gemma-3-4b-it" -o model.vindex --level all --f16
+### 4. WalkModel (zero-copy mmap)
+
+Rust inference with mmap'd weights. Load RSS: ~450 MB for a 4B model (vs 18 GB heap).
+For 120B models: ~1 GB RSS instead of 220 GB.
+
+```python
+wm = larql.WalkModel("model.vindex", top_k=4096)
+result = wm.predict("The capital of France is")
+# [("Paris", 0.498), ...]
 ```
+
+### Memory Comparison (Gemma 3 4B, f32)
+
+| Path | Load RSS | Inference RSS | How |
+|---|---|---|---|
+| WalkModel (mmap) | 450 MB | ~20 GB (paged) | Zero-copy, OS manages pages |
+| Native MLX | 8.6 GB | 8.6 GB | All weights in GPU memory |
+| vindex.infer | 18 GB | 18 GB | Heap-loaded weights |
+
+For 120B models the gap is transformative: WalkModel ~1 GB vs native 220 GB.
 
 ## LQL Session
 
-Full query language access alongside direct numpy API:
-
 ```python
-session = larql.session("output/gemma3-4b-v2.vindex")
-
-# LQL queries
+session = larql.session("model.vindex")
 session.query("DESCRIBE 'France'")
 session.query("WALK 'The capital of France is' TOP 10")
-session.query("STATS")
-
-# Direct numpy access on the same session
-session.vindex.gate_vectors(layer=26)
+session.vindex.gate_vectors(layer=26)  # numpy access on same session
 ```
 
 ## API Reference
@@ -74,14 +107,22 @@ session.vindex.gate_vectors(layer=26)
 | Function | Description |
 |---|---|
 | `larql.load(path)` | Load vindex, returns `Vindex` |
-| `larql.session(path)` | Create LQL session with `.query()` and `.vindex` |
-| `larql.mlx.load(path)` | Load MLX model from vindex weights |
+| `larql.session(path)` | LQL session with `.query()` and `.vindex` |
+| `larql.mlx.load(path)` | MLX model from vindex (all weights in MLX) |
+| `larql.walk_ffn.load(path, top_k)` | MLX attention + Rust FFN (mmap'd) |
+| `larql.WalkModel(path, top_k)` | Rust inference with mmap'd weights |
+
+### Vindex — Inference
+
+| Method | Description |
+|---|---|
+| `infer(prompt, top_k_predictions=5, top_k_features=8192)` | Full Rust forward pass, returns `[(token, prob)]` |
 
 ### Vindex — Knowledge Queries
 
 | Method | Description |
 |---|---|
-| `describe(entity, band="knowledge", verbose=False)` | Find all knowledge edges for an entity |
+| `describe(entity, band="knowledge", verbose=False)` | Find all knowledge edges |
 | `has_edge(entity, relation=None)` | Check if entity has edges |
 | `get_target(entity, relation)` | Get target token for entity+relation |
 | `relations()` | List all relation types with counts |
@@ -101,8 +142,7 @@ session.vindex.gate_vectors(layer=26)
 | `feature_meta(layer, feature)` | `FeatureMeta` or `None` |
 | `feature(layer, feature)` | `dict` or `None` |
 | `feature_label(layer, feature)` | `str` or `None` |
-| `tokenize(text)` | `list[int]` |
-| `decode(ids)` | `str` |
+| `tokenize(text)` / `decode(ids)` | Tokenizer access |
 
 ### Vindex — KNN & Walk
 
@@ -120,18 +160,14 @@ session.vindex.gate_vectors(layer=26)
 | `insert(entity, relation, target, layer=None, confidence=0.8)` | Insert knowledge edge |
 | `delete(entity, relation=None, layer=None)` | Delete matching edges |
 
-### Vindex — Properties
+### WalkModel
 
-| Property | Type |
+| Method | Description |
 |---|---|
-| `num_layers` | `int` |
-| `hidden_size` | `int` |
-| `vocab_size` | `int` |
-| `model` | `str` — model ID |
-| `family` | `str` — architecture family |
-| `is_mmap` | `bool` |
-| `total_gate_vectors` | `int` |
-| `loaded_layers` | `list[int]` |
+| `WalkModel(path, top_k=8192)` | Load with mmap'd weights (zero-copy) |
+| `predict(prompt, top_k_predictions=5)` | Full forward pass, returns `[(token, prob)]` |
+| `ffn_layer(layer, x_bytes, seq_len)` | Per-layer sparse FFN (bytes in/out) |
+| `num_layers`, `hidden_size`, `top_k` | Properties |
 
 ### Session
 
@@ -156,39 +192,44 @@ session.vindex.gate_vectors(layer=26)
 crates/larql-python/
   src/
     lib.rs              # Module registration, graph bindings
-    vindex.rs           # PyVindex, describe, insert, relations
+    vindex.rs           # PyVindex: describe, insert, relations, infer
     session.rs          # PySession (LQL queries)
+    walk.rs             # WalkModel: mmap'd weights, Rust walk FFN
   python/larql/
     __init__.py         # Clean Python API
-    mlx.py              # MLX model loading from vindex (mmap, zero-copy)
+    mlx.py              # MLX model loading from vindex (mmap)
+    walk_ffn.py         # MLX attention + Rust walk FFN
   tests/
-    test_bindings.py    # 41 tests, synthetic vindex (no model dependency)
+    test_bindings.py    # Synthetic vindex tests + real vindex integration
   examples/
     knowledge.py        # Describe, relations, steering
     insert.py           # Insert knowledge, no training
     session.py          # LQL session + numpy access
+    infer.py            # Rust inference (vindex.infer / WalkModel)
     mlx_vindex.py       # MLX generation from vindex weights
   bench/
-    bench_bindings.py   # Load, KNN, walk, describe, MLX benchmarks
+    bench_bindings.py   # Speed + memory benchmarks
 ```
 
 ### Running Tests
 
 ```bash
-# Synthetic vindex tests (run anywhere, no model files needed)
+# Synthetic tests (run anywhere, no model files)
 pytest crates/larql-python/tests/ -v
 
-# With a real vindex (optional, more thorough)
+# With real vindex (integration tests for infer, WalkModel, MLX)
 REAL_VINDEX_PATH=output/gemma3-4b-v2.vindex pytest crates/larql-python/tests/ -v
 ```
 
-## Not Yet Implemented
+### Extracting a Vindex
 
-These are accessible via `session.query()` (LQL) or the CLI:
+```bash
+# Browse level (knowledge queries only)
+larql extract-index "google/gemma-3-4b-it" -o model.vindex
 
-- HuggingFace loading (`hf://...`)
-- Remote server connection
-- `select()` queries
-- `update()` mutation
-- Patch API (begin/save/apply)
-- Compile to safetensors/GGUF/MLX
+# All weights (for inference + MLX)
+larql extract-index "google/gemma-3-4b-it" -o model.vindex --level all
+
+# Half precision (recommended for MLX)
+larql extract-index "google/gemma-3-4b-it" -o model.vindex --level all --f16
+```

@@ -1,7 +1,5 @@
 """
-Benchmark larql Python bindings.
-
-Measures load time, embed, KNN, walk, describe, gate_vectors, and MLX load.
+Benchmark larql Python bindings — speed and memory.
 
 Usage:
     python bench/bench_bindings.py [path/to/model.vindex]
@@ -10,16 +8,18 @@ Usage:
 import sys
 import os
 import time
-import numpy as np
+import resource
 
 VINDEX_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
     os.path.dirname(__file__), "..", "..", "..", "output", "gemma3-4b-v2.vindex"
 )
 
 
+def rss_mb():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+
+
 def bench(name, fn, n=10):
-    """Run fn n times, report min/mean."""
-    # Warmup
     fn()
     times = []
     for _ in range(n):
@@ -28,7 +28,7 @@ def bench(name, fn, n=10):
         times.append(time.perf_counter() - t0)
     mean = sum(times) / len(times)
     mn = min(times)
-    print(f"  {name:<30} min={mn*1000:>8.2f}ms  mean={mean*1000:>8.2f}ms")
+    print(f"  {name:<35} min={mn*1000:>8.2f}ms  mean={mean*1000:>8.2f}ms")
     return mean
 
 
@@ -38,76 +38,103 @@ def main():
     print(f"Benchmarking: {VINDEX_PATH}")
     print()
 
-    # Load
+    # ── Load ──
+    print("=== Load ===")
+    r0 = rss_mb()
     t0 = time.perf_counter()
     vindex = larql.load(VINDEX_PATH)
-    load_time = time.perf_counter() - t0
-    print(f"  {'load()':<30} {load_time*1000:>8.1f}ms")
+    t1 = time.perf_counter()
+    r1 = rss_mb()
+    print(f"  {'larql.load()':<35} {(t1-t0)*1000:>8.1f}ms  RSS: {r1:.0f} MB (+{r1-r0:.0f})")
     print(f"  {vindex}")
     print()
 
+    # ── Core operations ──
+    print("=== Core Operations ===")
     bands = vindex.layer_bands()
     last_knowledge = bands["knowledge"][1]
 
-    # Embed
     bench("embed('France')", lambda: vindex.embed("France"))
-    bench("embed('John Coyle')", lambda: vindex.embed("John Coyle"))
-
-    # Tokenize
     bench("tokenize('hello world')", lambda: vindex.tokenize("hello world"))
-
-    # Gate vector (single)
     bench("gate_vector(L27, F0)", lambda: vindex.gate_vector(last_knowledge, 0))
-
-    # Gate vectors (full layer)
     bench("gate_vectors(L27)", lambda: vindex.gate_vectors(last_knowledge), n=3)
 
-    # KNN
     embed = vindex.embed("France")
     bench("gate_knn(L27, top=10)", lambda: vindex.gate_knn(last_knowledge, embed.tolist(), 10))
     bench("entity_knn('France', L27)", lambda: vindex.entity_knn("France", last_knowledge, 10))
 
-    # Walk
     layers = list(range(bands["knowledge"][0], bands["knowledge"][1] + 1))
     bench("entity_walk('France', knowledge)", lambda: vindex.entity_walk("France", layers, 5))
-
-    # Describe
     bench("describe('France')", lambda: vindex.describe("France"), n=5)
-    bench("describe('France', verbose)", lambda: vindex.describe("France", verbose=True), n=5)
-
-    # Feature metadata
-    bench("feature_meta(L27, F0)", lambda: vindex.feature_meta(last_knowledge, 0))
-    bench("feature_label(L27, F0)", lambda: vindex.feature_label(last_knowledge, 0))
-
-    # Relations
     bench("relations()", lambda: vindex.relations(), n=5)
-
-    # Cluster centre
     bench("cluster_centre('capital')", lambda: vindex.cluster_centre("capital"))
-
-    # Stats
     bench("stats()", lambda: vindex.stats())
-
-    # Insert
-    bench("insert()", lambda: vindex.insert("BenchEntity", "capital", "BenchCity"), n=5)
-
-    # MLX load
     print()
-    try:
-        t0 = time.perf_counter()
-        import larql.mlx
-        model, tokenizer = larql.mlx.load(VINDEX_PATH)
-        mlx_time = time.perf_counter() - t0
-        print(f"  {'larql.mlx.load()':<30} {mlx_time*1000:>8.1f}ms")
 
+    # ── Inference ──
+    print("=== Inference ===")
+
+    # vindex.infer (loads weights each time — one-shot)
+    r2 = rss_mb()
+    t2 = time.perf_counter()
+    result = vindex.infer("The capital of France is", top_k_predictions=1)
+    t3 = time.perf_counter()
+    r3 = rss_mb()
+    print(f"  {'vindex.infer()':<35} {(t3-t2)*1000:>8.0f}ms  RSS: +{r3-r2:.0f} MB  → {result[0][0]}")
+
+    # WalkModel (zero-copy mmap)
+    r4 = rss_mb()
+    t4 = time.perf_counter()
+    wm = larql.WalkModel(VINDEX_PATH, top_k=4096)
+    t5 = time.perf_counter()
+    r5 = rss_mb()
+    print(f"  {'WalkModel load (mmap)':<35} {(t5-t4)*1000:>8.0f}ms  RSS: {r5:.0f} MB (+{r5-r4:.0f})")
+
+    t6 = time.perf_counter()
+    result2 = wm.predict("The capital of France is")
+    t7 = time.perf_counter()
+    r6 = rss_mb()
+    print(f"  {'WalkModel.predict(k=4096)':<35} {(t7-t6)*1000:>8.0f}ms  RSS: {r6:.0f} MB (+{r6-r5:.0f})  → {result2[0][0]}")
+    print()
+
+    # ── MLX ──
+    print("=== MLX ===")
+    try:
         import mlx_lm
-        t0 = time.perf_counter()
-        model2, tokenizer2 = mlx_lm.load(vindex.model)
-        native_time = time.perf_counter() - t0
-        print(f"  {'mlx_lm.load() (native)':<30} {native_time*1000:>8.1f}ms")
-        print(f"  {'ratio':<30} {mlx_time/native_time:.1f}x")
+
+        # larql.mlx.load
+        r7 = rss_mb()
+        t8 = time.perf_counter()
+        model, tokenizer = larql.mlx.load(VINDEX_PATH)
+        t9 = time.perf_counter()
+        r8 = rss_mb()
+        print(f"  {'larql.mlx.load()':<35} {(t9-t8)*1000:>8.0f}ms  RSS: {r8:.0f} MB (+{r8-r7:.0f})")
+
+        t10 = time.perf_counter()
+        resp = mlx_lm.generate(model, tokenizer, prompt="The capital of France is", max_tokens=5, verbose=False)
+        t11 = time.perf_counter()
+        print(f"  {'mlx generate (5 tok)':<35} {(t11-t10)*1000:>8.0f}ms  → {resp.strip()}")
+        del model, tokenizer
+
+        # Native MLX
+        import gc; gc.collect()
+        r9 = rss_mb()
+        t12 = time.perf_counter()
+        model2, tok2 = mlx_lm.load("google/gemma-3-4b-it")
+        t13 = time.perf_counter()
+        r10 = rss_mb()
+        print(f"  {'mlx_lm.load() (native)':<35} {(t13-t12)*1000:>8.0f}ms  RSS: {r10:.0f} MB (+{r10-r9:.0f})")
+
+        t14 = time.perf_counter()
+        resp2 = mlx_lm.generate(model2, tok2, prompt="The capital of France is", max_tokens=5, verbose=False)
+        t15 = time.perf_counter()
+        print(f"  {'mlx generate native (5 tok)':<35} {(t15-t14)*1000:>8.0f}ms  → {resp2.strip()}")
+
     except ImportError:
-        print("  (mlx not installed — skipping MLX benchmarks)")
+        print("  (mlx not installed — skipping)")
+
+    print()
+    print("Done.")
 
 
 if __name__ == "__main__":

@@ -19,8 +19,6 @@ import json
 from pathlib import Path
 from typing import Tuple
 
-import numpy as np
-
 
 def load(vindex_path: str, top_k: int = 8192) -> Tuple:
     """Load MLX model with vindex walk FFN.
@@ -158,7 +156,7 @@ def _patch_mlp(model, walk_model, config):
         layers = model.layers
 
     class WalkMLP(nn.Module):
-        """MLP that delegates to Rust walk FFN."""
+        """MLP that delegates to Rust walk FFN. No numpy."""
         def __init__(self, layer_idx):
             super().__init__()
             self._layer_idx = layer_idx
@@ -168,21 +166,24 @@ def _patch_mlp(model, walk_model, config):
             hidden = shape[-1]
 
             if len(shape) == 3:
-                seq_len = shape[0] * shape[1]
                 x_2d = x.reshape(-1, hidden)
             else:
-                seq_len = shape[0]
                 x_2d = x
+            seq_len = x_2d.shape[0]
 
+            # MLX → f32 bytes → Rust (zero-copy) → bytes → MLX
             x_f32 = x_2d.astype(mx.float32)
             mx.eval(x_f32)
-            x_flat = np.array(x_f32, dtype=np.float32).flatten().tolist()
+            x_bytes = bytes(x_f32)
 
-            result_np = np.array(
-                walk_model.ffn_layer(layer=self._layer_idx, x=x_flat, seq_len=seq_len)
+            # Rust: gate KNN + sparse FFN — all computation in Rust
+            out_bytes = walk_model.ffn_layer(
+                layer=self._layer_idx, x_bytes=x_bytes, seq_len=seq_len
             )
 
-            out = mx.array(result_np).astype(x.dtype)
+            # bytes → MLX array
+            out = mx.array(memoryview(out_bytes).cast('f', (seq_len, hidden)))
+            out = out.astype(x.dtype)
             if len(shape) == 3:
                 out = out.reshape(shape)
             return out
