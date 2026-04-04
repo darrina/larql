@@ -57,34 +57,36 @@ fn select_edges(
     let mut rows: Vec<Row> = Vec::new();
 
     for &layer in &scan_layers {
-        if let Some(metas) = patched.down_meta_at(layer) {
-            for (feat_idx, meta_opt) in metas.iter().enumerate() {
-                if let Some(meta) = meta_opt {
-                    if let Some(ref ent) = req.entity {
-                        if !meta.top_token.to_lowercase().contains(&ent.to_lowercase()) {
-                            continue;
-                        }
-                    }
-                    if let Some(min_c) = req.min_confidence {
-                        if meta.c_score < min_c {
-                            continue;
-                        }
-                    }
-                    let relation = model.probe_labels.get(&(layer, feat_idx)).cloned();
-                    if let Some(ref rel_filter) = req.relation {
-                        match &relation {
-                            Some(r) if r.to_lowercase().contains(&rel_filter.to_lowercase()) => {}
-                            _ => continue,
-                        }
-                    }
-                    rows.push(Row {
-                        layer,
-                        feature: feat_idx,
-                        top_token: meta.top_token.clone(),
-                        c_score: meta.c_score,
-                        relation,
-                    });
+        let num_features = patched.num_features(layer);
+        for feat_idx in 0..num_features {
+            // Check probe label first (fast filter when relation is specified)
+            let relation = model.probe_labels.get(&(layer, feat_idx)).cloned();
+            if let Some(ref rel_filter) = req.relation {
+                match &relation {
+                    Some(r) if r.to_lowercase().contains(&rel_filter.to_lowercase()) => {}
+                    _ => continue,
                 }
+            }
+
+            // Get feature metadata (handles both heap and mmap down_meta)
+            if let Some(meta) = patched.feature_meta(layer, feat_idx) {
+                if let Some(ref ent) = req.entity {
+                    if !meta.top_token.to_lowercase().contains(&ent.to_lowercase()) {
+                        continue;
+                    }
+                }
+                if let Some(min_c) = req.min_confidence {
+                    if meta.c_score < min_c {
+                        continue;
+                    }
+                }
+                rows.push(Row {
+                    layer,
+                    feature: feat_idx,
+                    top_token: meta.top_token.clone(),
+                    c_score: meta.c_score,
+                    relation,
+                });
             }
         }
     }

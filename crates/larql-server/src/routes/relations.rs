@@ -55,32 +55,31 @@ fn list_relations(
     let mut tokens: HashMap<String, TokenInfo> = HashMap::new();
 
     for &layer in &scan_layers {
-        if let Some(metas) = patched.down_meta_at(layer) {
-            for meta_opt in metas.iter() {
-                if let Some(meta) = meta_opt {
-                    let tok = meta.top_token.trim();
-                    if tok.is_empty() || tok.len() < 2 {
-                        continue;
-                    }
-                    if meta.c_score < 0.2 {
-                        continue;
-                    }
-                    let key = tok.to_lowercase();
-                    let example_tok = meta
-                        .top_k
-                        .first()
-                        .map(|t| t.token.trim().to_string())
-                        .unwrap_or_default();
-                    let entry = tokens.entry(key).or_insert(TokenInfo {
-                        count: 0,
-                        max_score: 0.0,
-                        original: tok.to_string(),
-                        example: example_tok,
-                    });
-                    entry.count += 1;
-                    if meta.c_score > entry.max_score {
-                        entry.max_score = meta.c_score;
-                    }
+        let num_features = patched.num_features(layer);
+        for feat_idx in 0..num_features {
+            if let Some(meta) = patched.feature_meta(layer, feat_idx) {
+                let tok = meta.top_token.trim();
+                if tok.is_empty() || tok.len() < 2 {
+                    continue;
+                }
+                if meta.c_score < 0.2 {
+                    continue;
+                }
+                let key = tok.to_lowercase();
+                let example_tok = meta
+                    .top_k
+                    .first()
+                    .map(|t| t.token.trim().to_string())
+                    .unwrap_or_default();
+                let entry = tokens.entry(key).or_insert(TokenInfo {
+                    count: 0,
+                    max_score: 0.0,
+                    original: tok.to_string(),
+                    example: example_tok,
+                });
+                entry.count += 1;
+                if meta.c_score > entry.max_score {
+                    entry.max_score = meta.c_score;
                 }
             }
         }
@@ -101,10 +100,23 @@ fn list_relations(
         })
         .collect();
 
+    // Probe-confirmed relation labels (from feature_labels.json)
+    let mut probe_relations: HashMap<String, usize> = HashMap::new();
+    for label in model.probe_labels.values() {
+        *probe_relations.entry(label.clone()).or_insert(0) += 1;
+    }
+    let mut probe_sorted: Vec<(&String, &usize)> = probe_relations.iter().collect();
+    probe_sorted.sort_by(|a, b| b.1.cmp(a.1));
+    let probe_list: Vec<serde_json::Value> = probe_sorted.iter()
+        .map(|(name, count)| serde_json::json!({"name": name, "count": count}))
+        .collect();
+
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(serde_json::json!({
         "relations": relations,
+        "probe_relations": probe_list,
+        "probe_count": model.probe_labels.len(),
         "total": tokens.len(),
         "latency_ms": (latency_ms * 10.0).round() / 10.0,
     }))
