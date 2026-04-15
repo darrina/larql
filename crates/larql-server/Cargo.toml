@@ -33,4 +33,8 @@ thiserror = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.13"
+
+# On Windows, protobuf-src fails to build from source (MSVC/Abseil CRT issue).
+# Install protoc manually instead: winget install Google.Protobuf
+[target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = "2"

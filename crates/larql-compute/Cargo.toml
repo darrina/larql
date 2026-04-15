@@ -16,6 +16,11 @@ ndarray = { version = "0.16", features = ["blas"] }
 blas-src = { version = "0.10", features = ["openblas"], default-features = false }
 openblas-src = { version = "0.10", features = ["system"] }
 
+# Windows: blas-src with no backend features (empty crate satisfies `extern crate blas_src`);
+# static OpenBLAS linking is handled directly in build.rs via VCPKG_ROOT.
+[target.'cfg(windows)'.dependencies]
+blas-src = { version = "0.10", default-features = false }
+
 # Metal GPU (macOS only, optional)
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.29", optional = true }
